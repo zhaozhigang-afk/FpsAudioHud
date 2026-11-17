@@ -17,7 +17,7 @@ HUD 无黑色背景、置顶、鼠标穿透，不挡操作；所有参数都在�
 
 ## 1. 快速开始
 
-> 已提供打包好的 `dist\FPS_Audio_Radar.exe`，也可以直接用 Python 运行。
+> 已提供打包好的 `dist\FPS_Audio_Radar.exe`，也可以直接用 Python 运行。(请双击build_exe.bat的批处理生成应用程序，提前安装好python环境并且安装pip才可以正常使用)
 
 ### 1.1 EXE（最简单）
 
