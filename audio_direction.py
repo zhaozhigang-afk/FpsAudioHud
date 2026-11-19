@@ -166,6 +166,48 @@ def intensity_from_snr(snr, threshold):
     return clamp(value, 0.12, 1.0)
 
 
+# ---- 灵敏度：把「信噪比阈值」换算成实际生效的等效阈值 ----
+# 1.0 = 中性（阈值原样使用）；越大越灵敏 = 等效阈值越低。
+# 下限 1.25：稳定环境音自己就有 ~1.1 的 snr，再低整块 HUD 会常亮；
+# 上限 4.5：再高基本什么都听不到，属于无效区间。
+SENSITIVITY_MIN = 0.5
+SENSITIVITY_MAX = 2.5
+EFF_THRESHOLD_MIN = 1.25
+EFF_THRESHOLD_MAX = 4.5
+
+
+BAND_MIN_HZ = 20.0
+BAND_MAX_HZ = 20000.0
+BAND_MIN_SPAN = 50.0
+
+
+def effective_band(low, high):
+    """把用户输入的频带夹到合法范围：20~20000Hz，且至少 50Hz 宽。"""
+    try:
+        lo = float(low)
+        hi = float(high)
+    except (TypeError, ValueError):
+        return (150.0, 8000.0)
+    lo = min(BAND_MAX_HZ, max(BAND_MIN_HZ, lo))
+    hi = min(BAND_MAX_HZ, max(BAND_MIN_HZ, hi))
+    if hi - lo < BAND_MIN_SPAN:
+        hi = min(BAND_MAX_HZ, lo + BAND_MIN_SPAN)
+        if hi - lo < BAND_MIN_SPAN:
+            lo = hi - BAND_MIN_SPAN
+    return (lo, hi)
+
+
+def effective_snr_threshold(threshold, sensitivity=1.0):
+    """灵敏度 → 实际参与判断的信噪比阈值：threshold / sensitivity（带安全钳位）。"""
+    th = max(1e-6, float(threshold))
+    try:
+        sens = float(sensitivity)
+    except (TypeError, ValueError):
+        sens = 1.0
+    sens = min(SENSITIVITY_MAX, max(SENSITIVITY_MIN, sens if sens > 0 else 1.0))
+    return min(EFF_THRESHOLD_MAX, max(EFF_THRESHOLD_MIN, th / sens))
+
+
 # ============================ 方向估计器 ============================
 class DirectionEstimator:
     """
@@ -180,8 +222,13 @@ class DirectionEstimator:
         weights      各声道归一化权重（调试用）
     """
 
-    BAND_LOW_HZ = 60.0
-    BAND_HIGH_HZ = 12000.0
+    # 分析频带：默认 120~8000 Hz。低频轰鸣（载具/环境）和 8k 以上（雨声、枪声尾音）
+    # 对脚步判断没帮助，却会把自适应底噪整体抬高 —— 实测全带下 80Hz 轰鸣 0.06
+    # 能把 0.05 的脚步压到 0% 检出，改窄后恢复。可用 set_band() 运行中切换。
+    # 低切 150 而不是 120：FFT 分辨率 46.9Hz，120 只比 80Hz 高 2.5 个 bin，
+    # 汉宁窗泄漏压不住（实测 120 仍然 0% 检出，150 才恢复）。
+    BAND_LOW_HZ = 150.0
+    BAND_HIGH_HZ = 8000.0
     HISTORY_SECONDS = 2.5   # 底噪统计窗口
     NOISE_PERCENTILE = 15.0 # 取窗口内 15% 分位数作为底噪
     NOISE_FACTOR = 1.8      # 参与方向计算前，从声道电平里扣掉多少倍底噪
@@ -202,6 +249,11 @@ class DirectionEstimator:
         self._levels = np.zeros(0)
         self._history = deque()
         self._history_len = 1
+        self.band_low = float(self.BAND_LOW_HZ)
+        self.band_high = float(self.BAND_HIGH_HZ)
+        # 多段 EQ：[(lo, hi, gain_db), ...]，空 = 全 0 dB（只受低切/高切影响）
+        self._eq_segments = ()
+        self._eq_gain2 = None
         self._win = None
         self._win_energy = 1.0
         self._freqs = None
@@ -216,12 +268,74 @@ class DirectionEstimator:
         self._win = np.hanning(n).astype(np.float64)
         self._win_energy = float(np.sum(self._win ** 2)) or 1.0
         self._freqs = np.fft.rfftfreq(n, 1.0 / self.sample_rate)
-        mask = (self._freqs >= self.BAND_LOW_HZ) & (self._freqs <= self.BAND_HIGH_HZ)
-        if not bool(np.any(mask)):
-            mask = np.ones_like(self._freqs, dtype=bool)
-        self._band_mask = mask
+        self._rebuild_band_mask()
+        self._rebuild_eq_weight()
         self._history_len = max(8, int(self.HISTORY_SECONDS * self.sample_rate / n))
         self._history = deque(self._history, maxlen=self._history_len)
+
+    # ---------- 频带 ----------
+    @property
+    def band(self):
+        """当前分析频带 (low, high) Hz。"""
+        return (self.band_low, self.band_high)
+
+    def set_band(self, low=None, high=None):
+        """运行中切换分析频带（只影响检测，不改音频本身）。非法值原样保留。"""
+        try:
+            lo = float(low) if low is not None else self.band_low
+            hi = float(high) if high is not None else self.band_high
+        except (TypeError, ValueError):
+            return
+        if lo <= 0.0 or hi <= lo:
+            return
+        self.band_low, self.band_high = lo, hi
+        self._rebuild_band_mask()
+        # 电平是按频带算的，换带后旧底噪不再可比 —— 必须清掉，
+        # 否则切档后会有 2.5 秒用错底噪（表现为突然满屏或整片不漏）
+        self._history.clear()
+
+    # ---------- 多段 EQ ----------
+    @property
+    def eq_segments(self):
+        """当前 EQ 段：((lo, hi, gain_db), ...)"""
+        return self._eq_segments
+
+    def set_eq(self, segments):
+        """设置多段 EQ。段按顺序覆盖：同一 bin 被多段覆盖时，后面的段生效。"""
+        cleaned = []
+        for seg in segments or ():
+            try:
+                lo = float(seg["lo"])
+                hi = float(seg["hi"])
+                gain = float(seg["gain_db"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+            if hi <= lo or hi <= 0.0:
+                continue
+            cleaned.append((max(0.0, lo), hi, max(-60.0, min(24.0, gain))))
+        self._eq_segments = tuple(cleaned)
+        self._rebuild_eq_weight()
+
+    def _rebuild_eq_weight(self):
+        if self._freqs is None:
+            return
+        weight = np.ones(len(self._freqs), dtype=np.float64)
+        for lo, hi, gain_db in self._eq_segments:
+            mask = (self._freqs >= lo) & (self._freqs < hi)
+            if not bool(np.any(mask)):
+                continue
+            amp = 10.0 ** (gain_db / 20.0)
+            weight[mask] = amp * amp          # 作用在功率上
+        self._eq_gain2 = weight
+
+    def _rebuild_band_mask(self):
+        freqs = self._freqs
+        if freqs is None:
+            return
+        mask = (freqs >= self.band_low) & (freqs <= self.band_high)
+        if not bool(np.any(mask)):
+            mask = np.ones_like(freqs, dtype=bool)
+        self._band_mask = mask
 
     def set_channels(self, n_channels):
         n = max(1, int(n_channels))
@@ -232,10 +346,10 @@ class DirectionEstimator:
         self._nf = np.zeros(n, dtype=np.float64)
         self._levels = np.zeros(n, dtype=np.float64)
         self.stereo = is_stereo_layout(n)
-        # 预热：把历史窗口填成"安静的底噪"，第一块音频就能被识别
-        self._history = deque(
-            [np.full(n, 1e-4, dtype=np.float64) for _ in range(self._history_len)],
-            maxlen=self._history_len)
+        # 历史窗口留空：用 1e-4 塞满会让头 2.5 秒的底噪被严重低估
+        # （floor 掉到噪声门，snr 直接飙到 1.4~3.8），开机那几秒会满屏误报。
+        # 预热阶段改由 process() 里的"已观测最小电平"兜底。
+        self._history = deque(maxlen=self._history_len)
 
     @property
     def levels(self):
@@ -244,10 +358,7 @@ class DirectionEstimator:
 
     def reset(self):
         self._nf = np.zeros(self.channels, dtype=np.float64)
-        self._history = deque(
-            [np.full(self.channels, 1e-4, dtype=np.float64)
-             for _ in range(self._history_len)],
-            maxlen=self._history_len)
+        self._history = deque(maxlen=self._history_len)
 
     # ---------- 多声源聚类 ----------
     def _cluster_weights(self, weights):
@@ -331,7 +442,13 @@ class DirectionEstimator:
         data = data - data.mean(axis=0, keepdims=True)
         spectrum = np.fft.rfft(data * self._win[:, None], axis=0)
         power = spectrum.real ** 2 + spectrum.imag ** 2
-        band_power = power[self._band_mask].sum(axis=0)
+        # 多段 EQ 直接作用在频域：段内乘 10^(dB/10)，段外保持 1。
+        # 所有声道同一套权重 → 只改电平关系，不改方向。
+        if self._eq_gain2 is None:
+            band_power = power[self._band_mask].sum(axis=0)
+        else:
+            weight = self._eq_gain2 * self._band_mask
+            band_power = (power * weight[:, None]).sum(axis=0)
         # 由帕塞瓦尔定理还原带内 RMS（不要加极小值，否则静音声道会变成
         # 均匀的微小权重，在没有有效声源时算出一个假方向）
         levels = np.sqrt(np.maximum(2.0 * band_power / (n * self._win_energy), 0.0))
@@ -341,10 +458,17 @@ class DirectionEstimator:
         # 用分位数而不是"当前最小值"：一声脚步不会把底噪抬起来，
         # 持续的环境噪音/音乐在 2.5 秒后才会被当成底噪，脚步声依旧能抓到。
         self._history.append(levels)
-        if len(self._history) >= 4:
-            noise = np.percentile(np.asarray(self._history), self.NOISE_PERCENTILE, axis=0)
+        window = np.asarray(self._history)
+        if window.shape[0] >= max(8, self._history_len // 4):
+            noise = np.percentile(window, self.NOISE_PERCENTILE, axis=0)
+        elif window.shape[0] >= 2:
+            # 预热阶段：拿"之前几块"的最小电平当底噪（不含当前块，
+            # 否则第一声巨响会把自己的底噪一起抬高，反而检测不到）
+            noise = np.min(window[:-1], axis=0)
         else:
-            noise = np.full_like(levels, 1e-4)
+            # 第一块：用 -60 dBFS 量级的保守底噪，稳定环境音 snr≈1.4 只闪一块，
+            # 而枪声/脚步这种瞬态仍然是几十倍，不会被误杀
+            noise = np.full_like(levels, 1e-3)
         noise = np.maximum(noise, 1e-6)
         self._nf = noise
 

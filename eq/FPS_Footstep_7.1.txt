@@ -1,0 +1,17 @@
+# FPS footstep EQ - Equalizer APO / Peace
+# Cut 60-150Hz rumble and vehicle low end, lift 2-4kHz footstep transients.
+# IMPORTANT: use ONE curve for ALL channels. Per-channel curves break direction.
+Preamp: -4 dB
+
+# ---- low end ----
+Filter: ON HPQ Fc 25 Hz  Q 0.70
+Filter: ON HPQ Fc 90 Hz  Q 0.70
+Filter: ON PK  Fc 220 Hz Gain -3 dB Q 1.10
+
+# ---- mid ----
+Filter: ON PK  Fc 1200 Hz Gain +1.5 dB Q 1.00
+Filter: ON PK  Fc 2800 Hz Gain +3.0 dB Q 1.20
+Filter: ON PK  Fc 4500 Hz Gain +1.5 dB Q 1.50
+
+# ---- top ----
+Filter: ON HS  Fc 9000 Hz Gain -4 dB Q 0.70

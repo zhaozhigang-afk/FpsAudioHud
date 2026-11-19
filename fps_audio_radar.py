@@ -34,14 +34,17 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QSystemTrayIcon,
                              QMenu, QAction, QDialog, QFormLayout,
                              QDoubleSpinBox, QPushButton, QHBoxLayout,
                              QVBoxLayout, QGridLayout, QLabel, QSpinBox,
-                             QSlider, QCheckBox, QTabWidget, QComboBox)
-from PyQt5.QtCore import Qt, QTimer, QRectF
-from PyQt5.QtGui import (QPainter, QColor, QPen, QPixmap, QIcon, QFont)
+                             QSlider, QCheckBox, QTabWidget, QComboBox,
+                             QTableWidget, QTableWidgetItem)
+from PyQt5.QtCore import Qt, QTimer, QRectF, QUrl
+from PyQt5.QtGui import (QPainter, QColor, QPen, QPixmap, QIcon, QFont,
+                         QDesktopServices)
 
 from audio_direction import (SECTOR_NAMES, SECTOR_ANGLES_DEG,
                              DirectionEstimator, SourceTracker,
                              channel_names, channel_layout, CHANNEL_LABELS,
-                             intensity_from_snr, sector_name, clamp)
+                             intensity_from_snr, sector_name, clamp,
+                             effective_snr_threshold, effective_band)
 from hud_geometry import (HudConfig, HUD_MODES, MODE_NAMES, HUD_PRESET_NAMES,
                           HUD_COLOR_OPTIONS, HINT_NAMES, preset_config)
 from hud_window import HudWindow
@@ -86,11 +89,17 @@ def is_foreground_fullscreen(my_hwnd=0):
 SAMPLE_RATE = 48000
 BLOCK_SIZE = 1024
 
-SENSITIVITY = 1.3
+# ---- 推荐默认值（"日常通用"那一档）----
+# 灵敏度 = 阈值的缩放系数（1.0 中性）：实际阈值 = snr_threshold / sensitivity = 1.80
+SENSITIVITY = 1.0
 SNR_THRESHOLD = 1.8
-DIRECTION_GAIN = 1.0
-NOISE_GATE = 0.008
-EVENT_LIFETIME = 1.4
+DIRECTION_GAIN = 1.4       # 少量锐化：箭头更贴近真实声道，又不会左右乱跳
+NOISE_GATE = 0.008         # 8 声道下自适应底噪≈0.011 早已盖过它，留着兜底
+EVENT_LIFETIME = 1.4       # 一个脚步只占 40ms，靠这个撑成"看得见"
+# 分析频带：只影响检测，不改音频。150~8000 砍掉低频轰鸣与雨水/枪声尾音。
+# 实测：80Hz 轰鸣 0.06 时，全带 0% 检出 → 120Hz 仍 0% → 150Hz 恢复 12%（=瞬态块占比）。
+BAND_LOW = 150.0
+BAND_HIGH = 8000.0
 
 DEBUG = False
 
@@ -100,6 +109,12 @@ CONFIG = {
     "direction_gain":   DIRECTION_GAIN,
     "noise_gate":       NOISE_GATE,
     "event_lifetime":   EVENT_LIFETIME,
+    "band_low":         BAND_LOW,
+    "band_high":        BAND_HIGH,
+}
+
+# HUD / 设备侧的推荐默认值：CONFIG 和"恢复默认"共用同一份，避免两处不一致
+HUD_DEFAULTS = {
     "input_mode":       "auto",     # auto=按声道布局 / stereo=只当前左前右是立体声
     # ---- 全屏 HUD（音浪 / 指针）----
     "hud_mode":         "dual",     # 默认就开双 HUD（小雷达已经去掉）
@@ -110,16 +125,169 @@ CONFIG = {
     "center_dot":       True,       # 准星位置的红色中心点
     "center_dot_size":  3,          # 中心点半径（像素）
 }
+CONFIG.update(HUD_DEFAULTS)
 
 # 低/中/高 一键预设（音频侧）
+# 等效阈值 = snr_threshold / sensitivity，三档 2.5 / 1.8 / 1.25：
+#   低 = 防误报（漏远处，但基本不闪假方向）
+#   中 = 推荐默认（能抓 30m 级静步，条长还能反映远近）
+#   高 = 灵敏（阈值贴地板 1.25，误报最多，只适合安静环境）
+# 频带也跟档位走：低档保留全带（线索全，但容易被低频轰鸣压死），
+# 中/高档收窄到 120~8000（抗轰鸣），高档再叠 gate .003 + 等效阈值 1.25。
 PRESETS = {
-    "低": {"sensitivity": 0.8, "snr_threshold": 2.5, "direction_gain": 1.0, "noise_gate": 0.015},
-    "中": {"sensitivity": 1.3, "snr_threshold": 1.8, "direction_gain": 1.0, "noise_gate": 0.008},
-    "高": {"sensitivity": 2.0, "snr_threshold": 1.2, "direction_gain": 1.0, "noise_gate": 0.003},
+    "低": {"sensitivity": 0.8, "snr_threshold": 2.0, "direction_gain": 1.2,
+           "noise_gate": 0.015, "event_lifetime": 1.7,
+           "band_low": 60.0, "band_high": 12000.0},
+    "中": {"sensitivity": 1.0, "snr_threshold": 1.8, "direction_gain": 1.4,
+           "noise_gate": 0.008, "event_lifetime": 1.4,
+           "band_low": 150.0, "band_high": 8000.0},
+    "高": {"sensitivity": 1.6, "snr_threshold": 2.0, "direction_gain": 1.8,
+           "noise_gate": 0.003, "event_lifetime": 1.2,
+           "band_low": 150.0, "band_high": 8000.0},
 }
+
+# 托盘菜单里的 EQ 快捷档（低切, 高切）；None 表示"自定义..."入口
+EQ_LEVELS = (
+    ("全带 60-12000（线索最全）", 60.0, 12000.0),
+    ("抗低频轰鸣 150-8000（推荐）", 150.0, 8000.0),
+    ("强抗低频 200-6000", 200.0, 6000.0),
+    ("只要脚步带 250-5000", 250.0, 5000.0),
+    ("自定义...", None, None),
+)
+
+# 多段 EQ 的默认曲线：按 48k/1024（46.9Hz/bin）挑的，每段至少 2 个 bin，
+# 只覆盖"脚步/材质/尾音"三类有用的区间；低频轰鸣交给低切，8k 以上交给高切。
+EQ_SEGMENTS_DEFAULT = [
+    {"lo": 150.0,  "hi": 250.0,  "gain_db": -2.0},   # 低频残留，略压
+    {"lo": 250.0,  "hi": 500.0,  "gain_db": 0.0},    # 脚步闷响主体，不动
+    {"lo": 500.0,  "hi": 1200.0, "gain_db": 1.0},    # 衣物摩擦/地板
+    {"lo": 1200.0, "hi": 2500.0, "gain_db": 4.0},    # 脚步瞬态核心
+    {"lo": 2500.0, "hi": 5000.0, "gain_db": 3.0},    # 材质（碎石/金属/玻璃）
+    {"lo": 5000.0, "hi": 8000.0, "gain_db": -6.0},   # 枪声尾音/雨声
+]
+
+# EQ 曲线预设
+EQ_CURVE_PRESETS = {
+    "脚步增强（默认）": [dict(s) for s in EQ_SEGMENTS_DEFAULT],
+    "均衡（全 0dB）": [{"lo": 150.0, "hi": 8000.0, "gain_db": 0.0}],
+    "强抗轰鸣": [
+        {"lo": 150.0, "hi": 250.0, "gain_db": -6.0},
+        {"lo": 250.0, "hi": 500.0, "gain_db": -3.0},
+        {"lo": 500.0, "hi": 1200.0, "gain_db": 0.0},
+        {"lo": 1200.0, "hi": 2500.0, "gain_db": 2.0},
+        {"lo": 2500.0, "hi": 5000.0, "gain_db": 0.0},
+        {"lo": 5000.0, "hi": 8000.0, "gain_db": -8.0},
+    ],
+    "室内近战": [
+        {"lo": 150.0,  "hi": 250.0,  "gain_db": -4.0},
+        {"lo": 250.0,  "hi": 400.0,  "gain_db": -2.0},
+        {"lo": 400.0,  "hi": 800.0,  "gain_db": -2.0},
+        {"lo": 800.0,  "hi": 1600.0, "gain_db": 2.0},
+        {"lo": 1600.0, "hi": 3000.0, "gain_db": 4.0},
+        {"lo": 3000.0, "hi": 5000.0, "gain_db": 4.0},
+        {"lo": 5000.0, "hi": 8000.0, "gain_db": -2.0},
+    ],
+    "室外草地 / 沙地": [
+        {"lo": 150.0,  "hi": 300.0,  "gain_db": -3.0},
+        {"lo": 300.0,  "hi": 500.0,  "gain_db": -2.0},
+        {"lo": 500.0,  "hi": 900.0,  "gain_db": 2.0},
+        {"lo": 900.0,  "hi": 1600.0, "gain_db": 3.0},
+        {"lo": 1600.0, "hi": 3000.0, "gain_db": 4.0},
+        {"lo": 3000.0, "hi": 6000.0, "gain_db": 3.0},
+        {"lo": 6000.0, "hi": 8000.0, "gain_db": -2.0},
+    ],
+    "雨雪天气": [
+        {"lo": 150.0,  "hi": 300.0,  "gain_db": -2.0},
+        {"lo": 300.0,  "hi": 800.0,  "gain_db": 0.0},
+        {"lo": 800.0,  "hi": 1500.0, "gain_db": 3.0},
+        {"lo": 1500.0, "hi": 3000.0, "gain_db": 4.0},
+        {"lo": 3000.0, "hi": 5000.0, "gain_db": 2.0},
+        {"lo": 5000.0, "hi": 6500.0, "gain_db": -4.0},
+        {"lo": 6500.0, "hi": 8000.0, "gain_db": -8.0},
+    ],
+    "载具 / 引擎环境": [
+        {"lo": 150.0,  "hi": 300.0,  "gain_db": -8.0},
+        {"lo": 300.0,  "hi": 600.0,  "gain_db": -4.0},
+        {"lo": 600.0,  "hi": 1500.0, "gain_db": 0.0},
+        {"lo": 1500.0, "hi": 3000.0, "gain_db": 3.0},
+        {"lo": 3000.0, "hi": 5000.0, "gain_db": 1.0},
+        {"lo": 5000.0, "hi": 8000.0, "gain_db": -2.0},
+    ],
+    "交火（枪声多）": [
+        {"lo": 150.0,  "hi": 300.0,  "gain_db": -4.0},
+        {"lo": 300.0,  "hi": 1200.0, "gain_db": 0.0},
+        {"lo": 1200.0, "hi": 2500.0, "gain_db": 3.0},
+        {"lo": 2500.0, "hi": 5000.0, "gain_db": 4.0},
+        {"lo": 5000.0, "hi": 7000.0, "gain_db": -5.0},
+        {"lo": 7000.0, "hi": 8000.0, "gain_db": -8.0},
+    ],
+    "耳机偏闷补偿": [
+        {"lo": 150.0,  "hi": 500.0,  "gain_db": 0.0},
+        {"lo": 500.0,  "hi": 1200.0, "gain_db": 2.0},
+        {"lo": 1200.0, "hi": 2500.0, "gain_db": 5.0},
+        {"lo": 2500.0, "hi": 5000.0, "gain_db": 5.0},
+        {"lo": 5000.0, "hi": 8000.0, "gain_db": 3.0},
+    ],
+}
+
+def default_eq_segments():
+    """默认 EQ 曲线的深拷贝（CONFIG / 恢复默认各拿一份，避免共用同一个 list）。"""
+    return [dict(seg) for seg in EQ_SEGMENTS_DEFAULT]
+
+
+CONFIG["eq_segments"] = default_eq_segments()
 
 LAYOUT_DESC = {1: "单声道", 2: "立体声", 3: "2.1", 4: "4.0", 5: "5.0",
                6: "5.1", 7: "6.1", 8: "7.1"}
+
+
+# ============================ 多段 EQ 工具 ============================
+EQ_MAX_SEGMENTS = 16
+EQ_GAIN_LIMIT = 24.0
+FFT_BIN_HZ = SAMPLE_RATE / float(BLOCK_SIZE)      # 46.875 Hz @48k/1024
+
+
+def sanitize_eq(segments):
+    """把外部来的段清洗成合法列表：20~20000Hz、至少 50Hz 宽、增益 -24~+24"""
+    out = []
+    for seg in segments or ():
+        if not isinstance(seg, dict):
+            continue
+        try:
+            lo = float(seg.get("lo"))
+            hi = float(seg.get("hi"))
+            gain = float(seg.get("gain_db", 0.0))
+        except (TypeError, ValueError):
+            continue
+        lo, hi = effective_band(lo, hi)
+        out.append({"lo": lo, "hi": hi,
+                    "gain_db": max(-EQ_GAIN_LIMIT, min(EQ_GAIN_LIMIT, gain))})
+    out.sort(key=lambda item: item["lo"])
+    return out[:EQ_MAX_SEGMENTS]
+
+
+def eq_key(segments):
+    """用于判断是否要重建滤波器：结构化的元组，便于比较。"""
+    key = []
+    for seg in segments or ():
+        if not isinstance(seg, dict):
+            continue
+        try:
+            key.append((round(float(seg["lo"]), 1),
+                        round(float(seg["hi"]), 1),
+                        round(float(seg["gain_db"]), 2)))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return tuple(key)
+
+
+def eq_bin_count(lo, hi):
+    """该段在 1024 点 FFT 下覆盖多少个 bin（0 = 这段白设）"""
+    if hi <= lo:
+        return 0
+    first = int(math.ceil(lo / FFT_BIN_HZ))
+    last = int(math.ceil(hi / FFT_BIN_HZ)) - 1
+    return max(0, last - first + 1)
 
 
 # ============================ 音频分析器 ============================
@@ -291,10 +459,22 @@ class AudioAnalyzer:
                 return (None, 0)
 
             frames = data[:frame_count * channels].reshape(frame_count, channels)
+            # 分析频带跟预设走：低档全带、中/高档 120~8000，切档即时生效
+            band = (float(CONFIG.get("band_low", BAND_LOW)),
+                    float(CONFIG.get("band_high", BAND_HIGH)))
+            if self.estimator.band != band:
+                self.estimator.set_band(*band)
+            # 多段 EQ：结构变了才重建（每块只比较一次元组）
+            want_eq = eq_key(CONFIG.get("eq_segments"))
+            if self.estimator.eq_segments != want_eq:
+                self.estimator.set_eq(CONFIG.get("eq_segments"))
+            # 灵敏度只在这里生效：阈值 / 灵敏度 = 等效阈值，强度换算也用同一个值
+            eff_threshold = effective_snr_threshold(CONFIG["snr_threshold"],
+                                                    CONFIG["sensitivity"])
             source = self.estimator.process(
                 frames,
                 noise_gate=CONFIG["noise_gate"],
-                snr_threshold=CONFIG["snr_threshold"],
+                snr_threshold=eff_threshold,
                 direction_gain=CONFIG["direction_gain"],
                 stereo_pan=(CONFIG.get("input_mode") == "stereo" and channels > 2),
             )
@@ -312,7 +492,7 @@ class AudioAnalyzer:
             # components 由 DirectionEstimator 按声道角度聚类得到，每个分量单独跟踪。
             per_source = []
             if source is not None:
-                base = intensity_from_snr(source["snr"], CONFIG["snr_threshold"])
+                base = intensity_from_snr(source["snr"], eff_threshold)
                 components = source.get("components") or [{
                     "angle": source["angle"],
                     "share": 1.0,
@@ -572,33 +752,66 @@ SETTINGS_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~")
                             "FPSAudioHUD")
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 
+# 设置文件版本：
+#   1 = 灵敏度还是死参数的旧版（阈值语义不同）
+#   2 = 灵敏度生效，但默认值仍是旧的（增益 1.0 / 保留 1.4）
+#   3 = 现在这套推荐默认值
+#   4 = 加入可调分析频带（120~8000）
+SETTINGS_SCHEMA = 4
+
 AUDIO_DEFAULTS = {
     "sensitivity": SENSITIVITY,
     "snr_threshold": SNR_THRESHOLD,
     "direction_gain": DIRECTION_GAIN,
     "noise_gate": NOISE_GATE,
     "event_lifetime": EVENT_LIFETIME,
+    "band_low": BAND_LOW,
+    "band_high": BAND_HIGH,
+    "eq_segments": default_eq_segments(),
 }
 
 
 def save_settings(hud):
-    """把当前 CONFIG + HUD 参数写进 settings.json；写不了就静默跳过。"""
+    """
+    把当前 CONFIG + HUD 参数写进 settings.json；写不了就返回 False（不抛异常）。
+
+    先写 .tmp 再 os.replace：写到一半断电/被杀也不会留下半个 json，
+    最坏情况是旧文件还在，下次启动照旧能读。
+    """
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
-        data = {"config": dict(CONFIG), "hud": dataclasses.asdict(hud.config)}
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as handle:
+        data = {"schema": SETTINGS_SCHEMA,
+                "config": dict(CONFIG),
+                "hud": dataclasses.asdict(hud.config)}
+        tmp_path = SETTINGS_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, SETTINGS_PATH)
         return True
     except Exception:
         return False
 
 
 def load_settings():
+    """
+    读 settings.json；文件不存在返回 {}。
+    文件坏了（手改坏/写到一半）就把它备份成 settings.json.broken，
+    然后按默认值启动——不因为一个配置文件让整个程序起不来。
+    """
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
     except Exception:
+        try:
+            if os.path.exists(SETTINGS_PATH):
+                os.replace(SETTINGS_PATH, SETTINGS_PATH + ".broken")
+        except Exception:
+            pass
         return {}
 
 
@@ -606,8 +819,22 @@ def apply_saved_settings(hud):
     """启动时套用上次保存的设置（不认识的字段直接忽略）。"""
     saved = load_settings()
 
+    # 旧版（schema 1）的灵敏度是死参数、阈值语义也不同：音频参数回到新默认，
+    # 只保留 HUD 那部分，免得升级后"等效阈值"显示成 1.25 这种自相矛盾的组合。
+    try:
+        schema = int(saved.get("schema", 1) or 1)
+    except (TypeError, ValueError):
+        schema = 1
+    if schema < SETTINGS_SCHEMA:
+        for key, value in AUDIO_DEFAULTS.items():
+            CONFIG[key] = value
+        CONFIG["eq_segments"] = default_eq_segments()   # list 不能与默认值共用对象
+
     config = saved.get("config") or {}
     if isinstance(config, dict):
+        if schema < SETTINGS_SCHEMA:
+            # 旧版的音频参数整体丢弃（语义变了），但 HUD 颜色之类的照旧保留
+            config = {k: v for k, v in config.items() if k not in AUDIO_DEFAULTS}
         for key, value in config.items():
             if key not in CONFIG:
                 continue
@@ -615,6 +842,11 @@ def apply_saved_settings(hud):
                 CONFIG[key] = type(CONFIG[key])(value)
             except (TypeError, ValueError):
                 continue
+
+    # 频带兜底：手改坏的 settings.json 不至于让检测失效
+    CONFIG["band_low"], CONFIG["band_high"] = effective_band(
+        CONFIG.get("band_low", BAND_LOW), CONFIG.get("band_high", BAND_HIGH))
+    CONFIG["eq_segments"] = sanitize_eq(CONFIG.get("eq_segments") or default_eq_segments())
 
     hud_values = saved.get("hud") or {}
     if isinstance(hud_values, dict):
@@ -626,6 +858,290 @@ def apply_saved_settings(hud):
             except TypeError:
                 pass
     return saved
+
+
+class EQCurveView(QWidget):
+    """频段-增益示意图：横轴对数频率 20~20k，纵轴 -24~+24 dB。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.segments = []
+        self.band = (150.0, 8000.0)
+        self.setMinimumHeight(110)
+
+    def set_data(self, segments, band):
+        self.segments = list(segments or [])
+        self.band = band
+        self.update()
+
+    def _x(self, freq, width):
+        lo, hi = 20.0, 20000.0
+        t = (math.log10(max(lo, min(hi, float(freq)))) - math.log10(lo)) / (
+            math.log10(hi) - math.log10(lo))
+        return 8.0 + t * (width - 16.0)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self.width(), self.height()
+        mid = h / 2.0
+        p.fillRect(0, 0, w, h, QColor(24, 27, 30))
+
+        # 分析频带范围
+        x1, x2 = self._x(self.band[0], w), self._x(self.band[1], w)
+        p.fillRect(QRectF(x1, 0, max(1.0, x2 - x1), h), QColor(40, 46, 52))
+
+        # 频率刻度
+        p.setPen(QPen(QColor(70, 76, 82), 1))
+        for freq in (50, 100, 200, 500, 1000, 2000, 5000, 10000):
+            x = self._x(freq, w)
+            p.drawLine(int(x), 0, int(x), h)
+            p.setPen(QColor(120, 126, 132))
+            p.drawText(int(x) + 2, h - 3, "%d" % freq)
+            p.setPen(QPen(QColor(70, 76, 82), 1))
+        for db in (12, 0, -12):
+            y = mid - db / EQ_GAIN_LIMIT * (h / 2.0 - 12.0)
+            p.setPen(QPen(QColor(90, 96, 102), 1, Qt.DashLine))
+            p.drawLine(0, int(y), w, int(y))
+            p.setPen(QColor(120, 126, 132))
+            p.drawText(2, int(y) - 2, "%+d" % db)
+        p.setPen(QPen(QColor(70, 76, 82), 1))
+
+        # 段
+        for seg in self.segments:
+            xa = self._x(seg["lo"], w)
+            xb = self._x(seg["hi"], w)
+            gain = max(-EQ_GAIN_LIMIT, min(EQ_GAIN_LIMIT, float(seg["gain_db"])))
+            y = mid - gain / EQ_GAIN_LIMIT * (h / 2.0 - 12.0)
+            bins = eq_bin_count(seg["lo"], seg["hi"])
+            if bins <= 0:
+                color = QColor(120, 60, 60)          # 这段白设
+            elif gain >= 0:
+                color = QColor(80, 180, 120)
+            else:
+                color = QColor(210, 120, 70)
+            top = min(y, mid)
+            height = max(2.0, abs(y - mid))
+            if y > mid:                      # 负增益往下画
+                top = mid
+            p.fillRect(QRectF(min(xa, xb), top, max(1.5, abs(xb - xa)), height), color)
+        p.end()
+
+
+class EQWindow(QDialog):
+    """多段 EQ 窗口：每段 起点/终点/增益，可增删，改动即时生效。"""
+
+    MAX_SEGMENTS = EQ_MAX_SEGMENTS
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("EQ 多段设置")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(520)
+        self._loading = True
+        self._segments = sanitize_eq(CONFIG.get("eq_segments") or [])
+
+        layout = QVBoxLayout(self)
+
+        band_row = QHBoxLayout()
+        band_row.addWidget(QLabel("分析频带：低切"))
+        self.spin_low = QDoubleSpinBox()
+        self.spin_low.setRange(20, 20000)
+        self.spin_low.setDecimals(0)
+        self.spin_low.setSingleStep(10)
+        self.spin_low.setValue(float(CONFIG["band_low"]))
+        self.spin_low.valueChanged.connect(self._on_band_changed)
+        band_row.addWidget(self.spin_low)
+        band_row.addWidget(QLabel("高切"))
+        self.spin_high = QDoubleSpinBox()
+        self.spin_high.setRange(20, 20000)
+        self.spin_high.setDecimals(0)
+        self.spin_high.setSingleStep(10)
+        self.spin_high.setValue(float(CONFIG["band_high"]))
+        self.spin_high.valueChanged.connect(self._on_band_changed)
+        band_row.addWidget(self.spin_high)
+        band_row.addStretch(1)
+        layout.addLayout(band_row)
+
+        self.curve = EQCurveView()
+        layout.addWidget(self.curve)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["起点 Hz", "终点 Hz", "增益 dB", "bin", "说明"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.setMinimumHeight(210)
+        layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("添加段")
+        btn_add.clicked.connect(self._add_segment)
+        btn_del = QPushButton("删除选中")
+        btn_del.clicked.connect(self._remove_segment)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_del)
+
+        btn_row.addWidget(QLabel("曲线预设:"))
+        self.cmb_preset = QComboBox()
+        for name in EQ_CURVE_PRESETS:
+            self.cmb_preset.addItem(name)
+        self.cmb_preset.currentTextChanged.connect(self._apply_curve_preset)
+        btn_row.addWidget(self.cmb_preset)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        hint = QLabel("一段至少要在 %dHz 的 FFT 里占 1 个 bin（%.1fHz）才有意义；"
+                      "标红的段在当前采样设置下无效。" % (BLOCK_SIZE, FFT_BIN_HZ))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888; font-size:10px;")
+        layout.addWidget(hint)
+
+        bottom = QHBoxLayout()
+        btn_reset = QPushButton("恢复默认曲线")
+        btn_reset.clicked.connect(self._reset_curve)
+        bottom.addWidget(btn_reset)
+        bottom.addStretch(1)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        bottom.addWidget(btn_close)
+        layout.addLayout(bottom)
+
+        self._loading = False
+        self._render()
+
+    # ---------- 数据 ----------
+    def _band(self):
+        return (float(self.spin_low.value()), float(self.spin_high.value()))
+
+    def _commit(self):
+        CONFIG["eq_segments"] = sanitize_eq(self._segments)
+        self._segments = [dict(s) for s in CONFIG["eq_segments"]]
+        self._refresh_metrics()
+
+    def _refresh_metrics(self):
+        for row, seg in enumerate(self._segments):
+            bins = eq_bin_count(seg["lo"], seg["hi"])
+            in_band = seg["lo"] < self._band()[1] and seg["hi"] > self._band()[0]
+            item_bins = self.table.item(row, 3)
+            if item_bins is not None:
+                item_bins.setText(str(bins))
+            item_note = self.table.item(row, 4)
+            if item_note is not None:
+                if bins <= 0:
+                    item_note.setText("无效：不足 1 个 bin")
+                    item_note.setForeground(QColor(210, 90, 90))
+                elif not in_band:
+                    item_note.setText("超出分析频带（低切/高切之外）")
+                    item_note.setForeground(QColor(210, 160, 70))
+                elif bins == 1:
+                    item_note.setText("勉强：1 个 bin")
+                    item_note.setForeground(QColor(200, 200, 120))
+                else:
+                    item_note.setText("有效")
+                    item_note.setForeground(QColor(130, 190, 130))
+        self.curve.set_data(self._segments, self._band())
+
+    def _render(self):
+        self._loading = True
+        self.table.setRowCount(len(self._segments))
+        for row, seg in enumerate(self._segments):
+            for col, key, lo, hi, step, dec in (
+                    (0, "lo", 20, 20000, 10, 0),
+                    (1, "hi", 20, 20000, 10, 0),
+                    (2, "gain_db", -EQ_GAIN_LIMIT, EQ_GAIN_LIMIT, 0.5, 1)):
+                spin = QDoubleSpinBox()
+                spin.setRange(lo, hi)
+                spin.setSingleStep(step)
+                spin.setDecimals(dec)
+                spin.setValue(float(seg[key]))
+                spin.valueChanged.connect(
+                    lambda value, r=row, k=key: self._on_segment_edit(r, k, value))
+                self.table.setCellWidget(row, col, spin)
+            for col in (3, 4):
+                item = QTableWidgetItem("")
+                self.table.setItem(row, col, item)
+        for col, width in ((0, 90), (1, 90), (2, 80), (3, 46)):
+            self.table.setColumnWidth(col, width)
+        self._loading = False
+        self._refresh_metrics()
+
+    def _on_segment_edit(self, row, key, value):
+        if self._loading or not (0 <= row < len(self._segments)):
+            return
+        self._segments[row][key] = float(value)
+        self._segments = sanitize_eq(self._segments)
+        self._commit()
+
+    def _on_band_changed(self, *_args):
+        if self._loading:
+            return
+        lo, hi = effective_band(self.spin_low.value(), self.spin_high.value())
+        CONFIG["band_low"], CONFIG["band_high"] = lo, hi
+        self._loading = True
+        self.spin_low.setValue(lo)
+        self.spin_high.setValue(hi)
+        self._loading = False
+        self._refresh_metrics()
+
+    # ---------- 增删 / 预设 ----------
+    def _add_segment(self):
+        if len(self._segments) >= self.MAX_SEGMENTS:
+            return
+        band_lo, band_hi = self._band()
+        edges = sorted((s["lo"], s["hi"]) for s in self._segments)
+        cursor = band_lo
+        gaps = []
+        for lo, hi in edges:
+            if lo > cursor:
+                gaps.append((cursor, lo))
+            cursor = max(cursor, hi)
+        if cursor < band_hi:
+            gaps.append((cursor, band_hi))
+        gaps = [g for g in gaps if g[1] - g[0] >= 100.0]
+        if gaps:
+            lo, hi = max(gaps, key=lambda g: g[1] - g[0])
+            mid = round((lo + hi) / 2.0)
+            self._segments.append({"lo": float(lo), "hi": float(mid), "gain_db": 0.0})
+        elif self._segments:
+            # 没有空隙：把最宽的一段对半劈开，后一半 0 dB
+            target = max(self._segments, key=lambda s: s["hi"] - s["lo"])
+            original_hi = float(target["hi"])
+            mid = round((float(target["lo"]) + original_hi) / 2.0)
+            target["hi"] = float(mid)
+            self._segments.append({"lo": float(mid), "hi": original_hi, "gain_db": 0.0})
+        else:
+            self._segments.append({"lo": max(20.0, band_hi - 200.0), "hi": band_hi,
+                                   "gain_db": 0.0})
+        self._commit()
+        self._render()
+        self.table.selectRow(len(self._segments) - 1)
+
+    def _remove_segment(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            if 0 <= row < len(self._segments):
+                del self._segments[row]
+        self._commit()
+        self._render()
+
+    def _apply_curve_preset(self, name):
+        preset = EQ_CURVE_PRESETS.get(name)
+        if self._loading or not preset:
+            return
+        self._segments = sanitize_eq([dict(s) for s in preset])
+        self._commit()
+        self._render()
+
+    def _reset_curve(self):
+        self._segments = default_eq_segments()
+        self._commit()
+        self._render()
 
 
 class SettingsWindow(QDialog):
@@ -642,7 +1158,27 @@ class SettingsWindow(QDialog):
         ("direction_gain", "方向增益",      0.5, 3.0, 0.1, 2),
         ("noise_gate",     "噪声门下限",    0.001, 0.05, 0.001, 4),
         ("event_lifetime", "提示保留(秒)",  0.5, 3.0, 0.1, 2),
+        ("band_low",       "低切(Hz)",      20, 20000, 10, 0),
+        ("band_high",      "高切(Hz)",      20, 20000, 10, 0),
     ]
+
+    # 每个参数到底管什么（鼠标悬停看，省得靠猜）
+    AUDIO_TOOLTIPS = {
+        "sensitivity": "缩放信噪比阈值：1.0 中性，越大越容易抓到远处的弱脚步"
+                       "（等效阈值 = 阈值 ÷ 灵敏度）。它不改变底噪，只改变判定线。",
+        "snr_threshold": "声音要比底噪强多少倍才显示：调高更干净但漏远处静步，"
+                         "调低更灵敏但误报多（稳定环境音的 snr 本来就在 1.0 附近）。",
+        "direction_gain": "只影响箭头锐度，不影响能听多远：>1 更贴近最近那个声道，"
+                          "<1 更平滑、抖动更少。",
+        "noise_gate": "完全没有声音时的最低门限。8 声道下自适应底噪通常已经高于它，"
+                      "所以绝大多数情况不用动。",
+        "event_lifetime": "声音停止后 HUD 还保留多久。一个脚步只占 40ms 左右，"
+                          "这个值才决定你看不看得见。",
+        "band_low": "分析频带的低切（只影响检测，不改音频）。抬到 150 以上能挡住"
+                    "低频轰鸣；低于 150 时 FFT 分辨率不够，挡不住载具/环境低频。",
+        "band_high": "分析频带的高切。8000 能砍掉雨水与枪声尾音；压到 5000 以下"
+                     "会开始丢脚步的高频瞬态（2~4kHz 是脚步的主线索）。",
+    }
 
     def __init__(self, controller, hud, parent=None):
         super().__init__(parent)
@@ -650,6 +1186,12 @@ class SettingsWindow(QDialog):
         self.hud = hud
         self.audio_spins = {}
         self._loading = True
+
+        # 改动后 0.4 秒自动落盘（拖滑块不会每一下都写文件）
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self._save_now)
 
         self.setWindowTitle("全部设置")
         self.setMinimumWidth(480)
@@ -674,6 +1216,7 @@ class SettingsWindow(QDialog):
         self.tabs.currentChanged.connect(self._sync_widgets)
         self._loading = False
         self._sync_widgets()
+        self._refresh_eff_label()
 
         self._diag_timer = QTimer(self)
         self._diag_timer.timeout.connect(self._update_diagnosis)
@@ -703,9 +1246,35 @@ class SettingsWindow(QDialog):
             spin.setDecimals(decimals)
             spin.setValue(float(CONFIG[key]))
             spin.valueChanged.connect(self._apply_audio)
+            spin.setToolTip(self.AUDIO_TOOLTIPS.get(key, ""))
             self.audio_spins[key] = spin
             form.addRow(label + ":", spin)
         layout.addLayout(form)
+
+        # 实时显示"等效阈值"和"分析频带"，避免几个旋钮互相打架看不出来
+        self.eff_label = QLabel("")
+        self.eff_label.setWordWrap(True)
+        self.eff_label.setStyleSheet("color:#7cb342; font-size:10px;")
+        layout.addWidget(self.eff_label)
+
+        self.band_label = QLabel("")
+        self.band_label.setWordWrap(True)
+        self.band_label.setStyleSheet("color:#888; font-size:10px;")
+        layout.addWidget(self.band_label)
+
+        hint_band = QLabel("低切/高切就是这套雷达的 EQ：砍掉不相关的频段，"
+                           "底噪降下来，远处脚步才越得过阈值。改完即时生效。")
+        hint_band.setWordWrap(True)
+        hint_band.setStyleSheet("color:#888; font-size:10px;")
+        layout.addWidget(hint_band)
+
+        eq_row = QHBoxLayout()
+        btn_eq = QPushButton("打开 EQ 多段窗口...")
+        btn_eq.setToolTip("每段可设起点/终点/增益，任意增删；改动即时生效")
+        btn_eq.clicked.connect(self._open_eq_window)
+        eq_row.addWidget(btn_eq)
+        eq_row.addStretch(1)
+        layout.addLayout(eq_row)
 
         hint = QLabel("提示保留：声音停止后，HUD 上的波形条和箭头还要淡出多久。")
         hint.setStyleSheet("color:#888; font-size:10px;")
@@ -725,6 +1294,42 @@ class SettingsWindow(QDialog):
             return
         for key, spin in self.audio_spins.items():
             CONFIG[key] = float(spin.value())
+        # 低切必须小于高切：非法组合自动夹住并回写界面，避免"看着改了其实没生效"
+        lo, hi = effective_band(CONFIG["band_low"], CONFIG["band_high"])
+        if abs(lo - CONFIG["band_low"]) > 1e-6 or abs(hi - CONFIG["band_high"]) > 1e-6:
+            CONFIG["band_low"], CONFIG["band_high"] = lo, hi
+            self._loading = True
+            self.audio_spins["band_low"].setValue(lo)
+            self.audio_spins["band_high"].setValue(hi)
+            self._loading = False
+        # 提示保留时间是 HUD 在用的参数，改完立刻生效，不用等关窗口
+        self.hud.set_lifetime(CONFIG["event_lifetime"])
+        self._refresh_eff_label()
+        self._touch()
+
+    def _open_eq_window(self):
+        EQWindow(self).exec_()
+        self._sync_widgets()
+        save_settings(self.hud)
+
+    def _refresh_eff_label(self):
+        th = float(CONFIG["snr_threshold"])
+        sens = float(CONFIG["sensitivity"])
+        eff = effective_snr_threshold(th, sens)
+        tag = "偏灵敏" if sens > 1.01 else ("偏保守" if sens < 0.99 else "中性")
+        self.eff_label.setText(
+            "等效阈值 %.2f（阈值 %.2f ÷ 灵敏度 %.2f，%s）→ 越低越容易看到远处静步"
+            % (eff, th, sens, tag))
+        lo = float(CONFIG.get("band_low", BAND_LOW))
+        hi = float(CONFIG.get("band_high", BAND_HIGH))
+        warn = []
+        if lo < 150.0:
+            warn.append("低切低于 150 挡不住低频轰鸣")
+        if hi < 5000.0:
+            warn.append("高切低于 5000 会丢脚步瞬态")
+        self.band_label.setText(
+            "分析频带 %.0f–%.0f Hz（只影响检测，不改音频）%s"
+            % (lo, hi, "：" + "；".join(warn) if warn else ""))
 
     def _apply_audio_preset(self, level):
         preset = PRESETS.get(level, {})
@@ -732,6 +1337,9 @@ class SettingsWindow(QDialog):
         for key, value in preset.items():
             if key in self.audio_spins:
                 self.audio_spins[key].setValue(float(value))
+            elif key in CONFIG:
+                # 频带这类没有滑条的参数直接落到 CONFIG
+                CONFIG[key] = float(value)
         self._loading = False
         self._apply_audio()
 
@@ -917,6 +1525,7 @@ class SettingsWindow(QDialog):
         CONFIG["center_dot"] = bool(cfg.center_dot)
         CONFIG["center_dot_size"] = int(cfg.center_dot_size)
         self.hud.apply_config(cfg)
+        self._touch()
 
     def _apply_hud_preset(self, *_args):
         if self._loading:
@@ -934,6 +1543,7 @@ class SettingsWindow(QDialog):
         CONFIG["hud_preset"] = name
         CONFIG["hud_max_sources"] = int(cfg.max_sources)
         self._sync_widgets()
+        self._touch()
 
     # ---------------- 设备页 ----------------
     def _build_device_tab(self):
@@ -949,6 +1559,15 @@ class SettingsWindow(QDialog):
         refresh_btn.clicked.connect(self._refresh_devices)
         form.addRow("", refresh_btn)
 
+        save_row = QHBoxLayout()
+        save_btn = QPushButton("立即保存配置")
+        save_btn.clicked.connect(self._save_now)
+        open_btn = QPushButton("打开配置文件夹")
+        open_btn.clicked.connect(self._open_config_dir)
+        save_row.addWidget(save_btn)
+        save_row.addWidget(open_btn)
+        form.addRow("配置:", save_row)
+
         self.cmb_input = QComboBox()
         self.cmb_input.addItem("自动（按声道布局）", "auto")
         self.cmb_input.addItem("立体声（只按前左/前右）", "stereo")
@@ -956,6 +1575,11 @@ class SettingsWindow(QDialog):
         form.addRow("输入模式:", self.cmb_input)
 
         layout.addLayout(form)
+
+        self.save_label = QLabel("改动会自动保存（防抖 0.4 秒）；也可以点「立即保存配置」。")
+        self.save_label.setWordWrap(True)
+        self.save_label.setStyleSheet("color:#888; font-size:10px;")
+        layout.addWidget(self.save_label)
 
         test_btn = QPushButton("HUD 方向自检...")
         test_btn.clicked.connect(self._open_check)
@@ -1006,6 +1630,7 @@ class SettingsWindow(QDialog):
             return
         key = self.cmb_input.currentData() or "auto"
         CONFIG["input_mode"] = key
+        self._touch()
 
     def _open_check(self):
         dialog = HudCheckDialog(self.controller, self)
@@ -1044,29 +1669,59 @@ class SettingsWindow(QDialog):
 
         self._fill_devices()
         self._loading = False
+        if hasattr(self, "eff_label"):
+            self._refresh_eff_label()
 
     def _reset_defaults(self):
         self._loading = True
         for key, value in AUDIO_DEFAULTS.items():
             CONFIG[key] = value
-        CONFIG.update({
-            "hud_mode": "dual",
-            "hint_logic": "focus",
-            "hud_preset": "平衡",
-            "hud_color": "red",
-            "hud_max_sources": 4,
-            "center_dot": True,
-            "center_dot_size": 3,
-            "input_mode": "auto",
-        })
+        CONFIG["eq_segments"] = default_eq_segments()
+        CONFIG.update(HUD_DEFAULTS)
         self.hud.apply_config(preset_config("平衡"))
         self.hud.set_mode("dual")
-        self.hud.set_hint_logic("focus")
+        self.hud.set_hint_logic(HUD_DEFAULTS["hint_logic"])
         self.hud.set_color_mode("red")
         self._loading = False
         self._sync_widgets()
+        self._touch()
+
+    # ---------------- 保存 ----------------
+    def _touch(self):
+        """标记有改动，0.4 秒后自动写盘（防抖）。"""
+        if self._loading:
+            return
+        self._save_timer.start()
+
+    def _save_now(self, *_args):
+        self._save_timer.stop()
+        ok = save_settings(self.hud)
+        if hasattr(self, "save_label"):
+            if ok:
+                self.save_label.setText("已保存 %s → %s" % (
+                    time.strftime("%H:%M:%S"), SETTINGS_PATH))
+                self.save_label.setStyleSheet("color:#7cb342; font-size:10px;")
+            else:
+                self.save_label.setText("保存失败：%s 不可写" % SETTINGS_PATH)
+                self.save_label.setStyleSheet("color:#e0a030; font-size:10px;")
+        return ok
+
+    def _open_config_dir(self):
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(SETTINGS_DIR))
+        except Exception:
+            pass
+
+    def done(self, result):
+        # 点「关闭」/按 Esc 走 accept()/reject()，不会触发 closeEvent，
+        # 这里必须自己存一次，否则改过的音频参数等于没改。
+        self._save_timer.stop()
+        save_settings(self.hud)
+        super().done(result)
 
     def closeEvent(self, event):
+        self._save_timer.stop()
         save_settings(self.hud)
         super().closeEvent(event)
 
@@ -1413,6 +2068,47 @@ def main():
         act.triggered.connect(_make_gain_switch(val))
         gain_actions[val] = act
         gain_menu.addAction(act)
+
+    # EQ（分析频带）：托盘里直接切常用档，多段自定义走 EQ 窗口
+    eq_menu = menu.addMenu("EQ 分析频带")
+    eq_actions = {}
+
+    def _open_eq_window():
+        EQWindow().exec_()
+        _save()
+
+    act_eq_window = QAction("打开 EQ 窗口（多段自定义）...", eq_menu)
+    act_eq_window.triggered.connect(_open_eq_window)
+    eq_menu.addAction(act_eq_window)
+    eq_menu.addSeparator()
+
+    def _apply_eq(low, high):
+        CONFIG["band_low"], CONFIG["band_high"] = effective_band(low, high)
+        _save()
+        for key, act in eq_actions.items():
+            act.setChecked(abs(key[0] - CONFIG["band_low"]) < 1e-6 and
+                           abs(key[1] - CONFIG["band_high"]) < 1e-6)
+
+    for name, low, high in EQ_LEVELS:
+        if low is None:
+            act = QAction(name, eq_menu)
+            act.triggered.connect(lambda: _open_settings(0))
+            eq_menu.addAction(act)
+            continue
+        act = QAction(name, eq_menu, checkable=True)
+        act.setChecked(abs(CONFIG["band_low"] - low) < 1e-6 and
+                       abs(CONFIG["band_high"] - high) < 1e-6)
+        act.triggered.connect(lambda checked=False, a=low, b=high: _apply_eq(a, b))
+        eq_actions[(low, high)] = act
+        eq_menu.addAction(act)
+
+    def _refresh_eq_checks():
+        # 设置窗口里改成自定义频带后，托盘菜单的勾也要跟着变
+        for key, act in eq_actions.items():
+            act.setChecked(abs(key[0] - CONFIG["band_low"]) < 1e-6 and
+                           abs(key[1] - CONFIG["band_high"]) < 1e-6)
+
+    eq_menu.aboutToShow.connect(_refresh_eq_checks)
 
     menu.addSeparator()
 
